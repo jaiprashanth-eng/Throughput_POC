@@ -1,0 +1,8 @@
+django>=4.2,<5.0
+djangorestframework
+celery[rabbitmq]
+redis
+psycopg2-binary
+python-dotenv
+requests
+gunicorn
