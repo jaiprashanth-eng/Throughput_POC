@@ -6,8 +6,8 @@ from django.utils.dateparse import parse_datetime
 
 from shared.models import JobStatus
 from shared.redis_utils import _get_client, _job_key, get_job_status, mark_item_done
-from shared.services import PriceService
 
+from system_a_mq.container import container
 from system_a_mq.celery_app import app
 
 logger = logging.getLogger(__name__)
@@ -56,8 +56,10 @@ def refresh_single_product_task(self, product_id: int, job_id: str):
     price_service_ms = None
     try:
         svc_start = time.time()
-        PriceService.refresh_single_product(product_id)
+        result = container.price_refresh_service.refresh_single_product(product_id)
         price_service_ms = (time.time() - svc_start) * 1000
+        if not result.success:
+            raise RuntimeError(result.error)
 
         mark_item_done(job_id, success=True)
         _sync_job_status_from_redis(job_id)
@@ -96,5 +98,4 @@ def refresh_single_product_task(self, product_id: int, job_id: str):
                 f"{price_service_ms:.2f}" if price_service_ms is not None else "n/a",
             )
             raise
-
 

@@ -11,15 +11,24 @@ controlled, identical conditions.
    docker compose up -d
    ```
 
-2. **Django server**
+2. **Django server (ASGI required for System B)**
    ```bash
    source .venv/bin/activate
    export REDIS_URL=redis://localhost:6379/0
-   export DIRECT_WORKER_THREADS=4
    export CELERYD_CONCURRENCY=4
+   export DIRECT_MAX_CONCURRENCY=4
    export MOCK_API_LATENCY_MS=80
-   python manage.py runserver
+   ./start_poc.sh async
    ```
+
+   IMPORTANT: System B now uses asyncio, not a thread pool.
+   DIRECT_WORKER_THREADS no longer exists — concurrency is unbounded by
+   default (every coroutine in a batch runs concurrently on one event
+   loop, gated only by Postgres/Redis connection pool limits, not a
+   worker count). ./start_poc.sh dev (the WSGI dev server) will crash
+   System B with "RuntimeError: no running event loop" the moment a
+   request hits asyncio.create_task() — do not use dev mode for any
+   System B testing from this point forward.
 
 3. **Celery worker** (required for System A only)
    ```bash

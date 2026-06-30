@@ -1,16 +1,19 @@
+import asyncio
+import json
 import time
 import uuid
 from typing import Optional
 
 from django.db.models import Avg, Count
-from rest_framework import status
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from shared.models import JobStatus
-from shared.redis_utils import create_job, get_job_status
+from shared.redis_utils import create_job_async, get_job_status_async
 
-from system_b_direct.executor import submit_refresh
+from system_b_direct.executor import refresh_batch_async
 
 
 def _percentile(values: list[float], p: float) -> Optional[float]:
@@ -24,28 +27,36 @@ def _percentile(values: list[float], p: float) -> Optional[float]:
     return sorted_vals[lower] * (1 - weight) + sorted_vals[upper] * weight
 
 
-@api_view(["POST"])
-def refresh(request):
+# DRF's @api_view is a sync wrapper — Django's ASGI handler cannot detect it as
+# async and will call it via sync_to_async, where awaiting is impossible.
+# Use plain Django async views + JsonResponse for the two hot-path endpoints.
+@csrf_exempt
+async def refresh(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+
     request_start = time.perf_counter()
 
-    product_ids = request.data.get("product_ids")
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    product_ids = data.get("product_ids")
     if not product_ids:
-        return Response(
-            {"error": "product_ids is required"},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
+        return JsonResponse({"error": "product_ids is required"}, status=400)
 
     job_id = str(uuid.uuid4())
     total = len(product_ids)
 
-    create_job(job_id, system="direct", total=total)
-    JobStatus.objects.create(job_id=job_id, system="direct", total=total, status="pending")
+    await create_job_async(job_id, system="direct", total=total)
+    await JobStatus.objects.acreate(job_id=job_id, system="direct", total=total, status="pending")
 
-    for product_id in product_ids:
-        submit_refresh(product_id, job_id)
+    # Fire-and-forget: returns immediately; batch runs in background on the event loop.
+    asyncio.create_task(refresh_batch_async(product_ids, job_id))
 
     dispatch_ms = (time.perf_counter() - request_start) * 1000
-    return Response(
+    return JsonResponse(
         {
             "job_id": job_id,
             "total": total,
@@ -56,17 +67,17 @@ def refresh(request):
     )
 
 
-@api_view(["GET"])
-def job_detail(request, job_id: str):
-    try:
-        job = get_job_status(job_id)
-    except KeyError:
-        return Response(
-            {"error": f"Job {job_id} not found"},
-            status=status.HTTP_404_NOT_FOUND,
-        )
+@csrf_exempt
+async def job_detail(request, job_id: str):
+    if request.method != "GET":
+        return JsonResponse({"error": "Method not allowed"}, status=405)
 
-    return Response(
+    try:
+        job = await get_job_status_async(job_id)
+    except KeyError:
+        return JsonResponse({"error": f"Job {job_id} not found"}, status=404)
+
+    return JsonResponse(
         {
             "job_id": job["job_id"],
             "system": job["system"],

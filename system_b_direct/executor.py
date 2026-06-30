@@ -1,131 +1,82 @@
 # PARITY CONTRACT with system_a_mq:
-# - Same PriceService call
-# - Same mock API latency (controlled by same env vars)
-# - Same DB (same Product table, same JobStatus table)
-# - Same Redis for job tracking
+# - Same PriceServiceAsync call (same mock API latency, same DB table, same Redis tracking)
+# - Same job lifecycle: pending → processing → done
+# - Same log format (task_complete / task_failed lines with latency_ms)
 # - Same batch sizes tested
-# - Same thread/worker count (DIRECT_WORKER_THREADS == CELERYD_CONCURRENCY)
-# - Same log format
-# Only difference: dispatch path (RabbitMQ+Celery vs ThreadPoolExecutor)
+# - Same concurrency cap (DIRECT_MAX_CONCURRENCY == CELERYD_CONCURRENCY),
+#   enforced via asyncio.Semaphore instead of a bounded thread pool
+# Only difference: dispatch path (RabbitMQ+Celery vs single-thread asyncio event loop).
+#
+# What is gone vs the ThreadPoolExecutor version:
+# - No ThreadPoolExecutor, no threading, no concurrent.futures
+# - No DIRECT_WORKER_THREADS env var (concurrency is coroutines, not OS threads)
+# - No close_old_connections() (no DB connections held across thread boundaries)
+# - No per-item DB sync — one DB sync after the full gather completes
 
-import concurrent.futures
+import asyncio
 import logging
 import os
-import threading
 import time
 from datetime import datetime, timezone as dt_timezone
-from typing import Optional
 
-from django.db import close_old_connections
 from django.utils.dateparse import parse_datetime
 
 from shared.models import JobStatus
-from shared.redis_utils import _get_client, _job_key, get_job_status, mark_item_done
-from shared.services import PriceService
+from shared.redis_utils import get_job_status_async, mark_item_done_async
+from shared.services_async import PriceServiceAsync
 
 logger = logging.getLogger(__name__)
 
-_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
-_executor_lock = threading.Lock()
 
-
-def get_executor() -> concurrent.futures.ThreadPoolExecutor:
-    global _executor
-    if _executor is None:
-        with _executor_lock:
-            if _executor is None:
-                max_workers = int(os.getenv("DIRECT_WORKER_THREADS", "4"))
-                _executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    return _executor
-
-
-def _record_first_task_start(job_id: str, start_time: float) -> None:
-    client = _get_client()
-    key = f"{_job_key(job_id)}:first_task_start_ms"
-    now_ms = int(start_time * 1000)
-    if client.setnx(key, now_ms):
-        enqueued_at_ms = client.hget(_job_key(job_id), "enqueued_at_ms")
-        if enqueued_at_ms:
-            first_task_latency_ms = now_ms - int(enqueued_at_ms)
-            logger.info(
-                "first_task_start job_id=%s first_task_start_latency_ms=%.2f",
-                job_id,
-                first_task_latency_ms,
-            )
-
-
-def _sync_job_status_from_redis(job_id: str) -> None:
-    status = get_job_status(job_id)
+async def _sync_job_status_to_db(job_id: str) -> None:
+    redis_data = await get_job_status_async(job_id)
     updates = {
-        "completed": status["completed"],
-        "failed_count": status["failed_count"],
+        "completed": redis_data["completed"],
+        "failed_count": redis_data["failed_count"],
     }
-
-    if status["status"] == "done":
+    if redis_data["status"] == "done":
         updates["status"] = "done"
-        updates["wall_time_ms"] = status["wall_time_ms"]
-        if status["finished_at"]:
-            updates["finished_at"] = parse_datetime(status["finished_at"])
-    elif status["completed"] + status["failed_count"] > 0:
+        updates["wall_time_ms"] = redis_data["wall_time_ms"]
+        if redis_data["finished_at"]:
+            updates["finished_at"] = parse_datetime(redis_data["finished_at"])
+    elif redis_data["completed"] + redis_data["failed_count"] > 0:
         updates["status"] = "processing"
+    await JobStatus.objects.filter(job_id=job_id).aupdate(**updates)
 
-    JobStatus.objects.filter(job_id=job_id).update(**updates)
+
+async def _refresh_worker_async(product_id: int, job_id: str) -> None:
+    task_start = time.monotonic()
+    try:
+        await PriceServiceAsync.refresh_single_product(product_id)
+        await mark_item_done_async(job_id, success=True)
+        logger.info(
+            "task_complete product_id=%s job_id=%s latency_ms=%.2f",
+            product_id,
+            job_id,
+            (time.monotonic() - task_start) * 1000,
+        )
+    except Exception:
+        await mark_item_done_async(job_id, success=False)
+        logger.info(
+            "task_failed product_id=%s job_id=%s latency_ms=%.2f",
+            product_id,
+            job_id,
+            (time.monotonic() - task_start) * 1000,
+        )
 
 
-def _mark_job_processing(job_id: str) -> None:
-    JobStatus.objects.filter(job_id=job_id, status="pending").update(
+async def refresh_batch_async(product_ids: list, job_id: str) -> None:
+    await JobStatus.objects.filter(job_id=job_id, status="pending").aupdate(
         status="processing",
         started_at=datetime.now(tz=dt_timezone.utc),
     )
 
+    max_concurrency = int(os.getenv("DIRECT_MAX_CONCURRENCY", "4"))
+    semaphore = asyncio.Semaphore(max_concurrency)
 
-def _refresh_worker(product_id: int, job_id: str) -> None:
-    close_old_connections()
-    task_start = time.time()
-    task_id = f"thread-{threading.get_ident()}"
-    _record_first_task_start(job_id, task_start)
-    _mark_job_processing(job_id)
+    async def _bounded_worker(pid: int) -> None:
+        async with semaphore:
+            await _refresh_worker_async(pid, job_id)
 
-    price_service_ms = None
-    try:
-        svc_start = time.time()
-        PriceService.refresh_single_product(product_id)
-        price_service_ms = (time.time() - svc_start) * 1000
-
-        mark_item_done(job_id, success=True)
-        _sync_job_status_from_redis(job_id)
-
-        task_end = time.time()
-        latency_ms = (task_end - task_start) * 1000
-        logger.info(
-            "task_complete task_id=%s product_id=%s job_id=%s start_time=%s end_time=%s "
-            "latency_ms=%.2f price_service_ms=%.2f",
-            task_id,
-            product_id,
-            job_id,
-            datetime.fromtimestamp(task_start, tz=dt_timezone.utc).isoformat(),
-            datetime.fromtimestamp(task_end, tz=dt_timezone.utc).isoformat(),
-            latency_ms,
-            price_service_ms,
-        )
-    except Exception:
-        mark_item_done(job_id, success=False)
-        _sync_job_status_from_redis(job_id)
-
-        task_end = time.time()
-        latency_ms = (task_end - task_start) * 1000
-        logger.info(
-            "task_failed task_id=%s product_id=%s job_id=%s start_time=%s end_time=%s "
-            "latency_ms=%.2f price_service_ms=%s",
-            task_id,
-            product_id,
-            job_id,
-            datetime.fromtimestamp(task_start, tz=dt_timezone.utc).isoformat(),
-            datetime.fromtimestamp(task_end, tz=dt_timezone.utc).isoformat(),
-            latency_ms,
-            f"{price_service_ms:.2f}" if price_service_ms is not None else "n/a",
-        )
-
-
-def submit_refresh(product_id: int, job_id: str) -> concurrent.futures.Future:
-    return get_executor().submit(_refresh_worker, product_id, job_id)
+    await asyncio.gather(*[_bounded_worker(pid) for pid in product_ids])
+    await _sync_job_status_to_db(job_id)

@@ -1,5 +1,6 @@
+from typing import Any
+
 from shared.price_refresh_service.schemas import JobDetailResponse, JobStatsResponse
-from shared.price_refresh_service.type import JobStats
 
 
 def job_redis_to_detail_response(job: dict) -> dict:
@@ -15,7 +16,7 @@ def job_redis_to_detail_response(job: dict) -> dict:
     ).model_dump()
 
 
-def job_stats_to_response(stats: JobStats) -> dict:
+def job_stats_to_response(stats: Any) -> dict:
     return JobStatsResponse(
         total_jobs=stats.total_jobs,
         avg_wall_time_ms=stats.avg_wall_time_ms,
