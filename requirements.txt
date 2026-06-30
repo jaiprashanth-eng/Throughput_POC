@@ -1,8 +1,10 @@
-django>=4.2,<5.0
+Django==5.2.11
 djangorestframework
+django-stubs-ext==5.2.2
 celery[rabbitmq]
 redis
 psycopg2-binary
 python-dotenv
 requests
 gunicorn
+uvicorn[standard]>=0.30

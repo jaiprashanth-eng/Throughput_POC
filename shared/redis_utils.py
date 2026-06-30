@@ -4,6 +4,7 @@ from datetime import datetime, timezone as dt_timezone
 from typing import Optional
 
 import redis
+import redis.asyncio as aioredis
 
 _redis_pool: "redis.ConnectionPool | None" = None
 
@@ -110,6 +111,60 @@ def mark_item_done(job_id: str, success: bool) -> None:
 def get_job_status(job_id: str) -> dict:
     client = _get_client()
     data = client.hgetall(_job_key(job_id))
+    if not data:
+        raise KeyError(f"Job {job_id} not found")
+    return _hash_to_dict(data)
+
+
+# ── async Redis client ────────────────────────────────────────────────────────
+# Mirrors the sync pool pattern above; uses redis.asyncio (bundled with redis-py).
+
+_async_redis_pool: "aioredis.ConnectionPool | None" = None
+
+
+def _get_async_pool() -> "aioredis.ConnectionPool":
+    global _async_redis_pool
+    if _async_redis_pool is None:
+        url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _async_redis_pool = aioredis.ConnectionPool.from_url(url, decode_responses=True, max_connections=50)
+    return _async_redis_pool
+
+
+def _get_async_client() -> "aioredis.Redis":
+    return aioredis.Redis(connection_pool=_get_async_pool())
+
+
+async def create_job_async(job_id: str, system: str, total: int) -> None:
+    client = _get_async_client()
+    now_ms = _now_ms()
+    await client.hset(
+        _job_key(job_id),
+        mapping={
+            "job_id": job_id,
+            "system": system,
+            "total": total,
+            "completed": 0,
+            "failed_count": 0,
+            "status": "pending",
+            "enqueued_at_ms": now_ms,
+        },
+    )
+
+
+async def mark_item_done_async(job_id: str, success: bool) -> None:
+    client = _get_async_client()
+    await client.eval(
+        _MARK_ITEM_DONE_SCRIPT,
+        1,
+        _job_key(job_id),
+        "1" if success else "0",
+        _now_ms(),
+    )
+
+
+async def get_job_status_async(job_id: str) -> dict:
+    client = _get_async_client()
+    data = await client.hgetall(_job_key(job_id))
     if not data:
         raise KeyError(f"Job {job_id} not found")
     return _hash_to_dict(data)

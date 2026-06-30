@@ -470,11 +470,12 @@ def print_comparison_table(
 
 def print_env_reminder(workers: int, latency_ms: int) -> None:
     print()
-    print("Ensure these env vars are set on Django + Celery worker before benchmarking:")
-    print(f"  export DIRECT_WORKER_THREADS={workers}")
+    print("Ensure Django is running via ./start_poc.sh async (not dev/prod)")
+    print("Ensure these env vars are set on the server + Celery worker before benchmarking:")
+    print(f"  export DIRECT_MAX_CONCURRENCY={workers}")
     print(f"  export CELERYD_CONCURRENCY={workers}")
     print(f"  export MOCK_API_LATENCY_MS={latency_ms}")
-    print("Restart runserver and Celery worker after changing env vars.")
+    print("Restart ./start_poc.sh async and Celery worker after changing env vars.")
     print()
 
 
